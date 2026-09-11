@@ -1,0 +1,587 @@
+"""
+flow_break_finder.py
+----------------------
+Finds "flow breakages" in an Excel workbook -- cells that sit inside an
+otherwise formula-driven column or row but are themselves hardcoded static
+values, where that value also shows up somewhere else in the workbook (or
+in other workbooks you point it at). That combination -- pattern break +
+matching value elsewhere -- is the strongest available signal that a cell
+which SHOULD have been formula-linked was instead manually copy-pasted,
+silently breaking the lineage trail at that exact point.
+
+This is a genuinely different check from what's already in the rest of
+the toolkit:
+  - sheet_tree_server.py / health_check.py's sheet flow only look at
+    REAL formula links -- a pasted cell simply doesn't show up as an edge
+    at all, so a break is invisible to them, not flagged.
+  - dashboard.py's "value" tier fuzzy-match only fires for a sheet with
+    ZERO formula connection to anything (a fallback for entirely
+    unreached sheets) -- it can't catch a break in the MIDDLE of an
+    otherwise formula-linked sheet, which is the more common real-world
+    case (one cell in a column of 40 formulas got overwritten).
+  - health_check.py's cross-file value fingerprinting looks for runs of
+    5+ CONSECUTIVE matching numbers with no regard to formula context at
+    all -- good for "these two sheets share a data block", not useful
+    for "this one specific cell is where the chain snapped".
+
+Two-part detection, both required together for a HIGH-confidence hit:
+  1. PATTERN BREAK: a static numeric cell with at least one formula cell
+     directly adjacent to it (same column, row above/below -- or same
+     row, column left/right). A formula-filled column/row with a single
+     hardcoded hole in it is exactly what a "someone pasted over this"
+     looks like.
+  2. VALUE MATCH: that cell's value also appears elsewhere -- in this
+     workbook, or in any additional workbook passed in -- excluding
+     values so common (0, 1, small round integers, or values that recur
+     dozens of times) that a match wouldn't mean anything.
+
+A pattern break with NO value match anywhere is still reported (as a
+lower-confidence "orphan break") -- it might be a legitimate manual
+input, but it's still worth a human glance.
+
+Requires:
+    pip install openpyxl
+
+Usage:
+    python flow_break_finder.py workbook.xlsx
+    python flow_break_finder.py workbook.xlsx --extra-files other1.xlsx other2.xlsx
+    python flow_break_finder.py workbook.xlsx --min-abs-value 0.01 --max-locations 15
+
+Outputs (next to the primary workbook):
+    <workbook>_flow_breaks.xlsx   -- full report (breaks-with-matches,
+                                      orphan breaks, skipped-common-values)
+    <workbook>_flow_breaks.html   -- sheet-flow diagram with break points
+                                      overlaid as dashed red/orange edges,
+                                      opened in your browser automatically
+"""
+
+import argparse
+import json
+import os
+import re
+import sys
+import webbrowser
+
+from openpyxl import load_workbook, Workbook
+from openpyxl.styles import Font, PatternFill
+from openpyxl.utils import get_column_letter
+
+# ---------------------------------------------------------------------
+# Formula parsing -- same regex approach as the rest of the toolkit
+# (sheet_tree_server.py / dashboard.py), trimmed down to just "which
+# sheets does this formula cross-reference", since that's all the flow
+# graph here needs (whether a real formula link already exists between
+# two sheets -- not the individual cell addresses).
+# ---------------------------------------------------------------------
+
+CELL_REF_RE = re.compile(
+    r"(?:(?:'([^']+)'|([A-Za-z_][A-Za-z0-9_]*))!)?"
+    r"(?<![A-Za-z0-9_])(\$?[A-Z]{1,3}\$?\d{1,7})(?::(\$?[A-Z]{1,3}\$?\d{1,7}))?(?!\()"
+)
+COLUMN_ONLY_RE = re.compile(
+    r"(?:(?:'([^']+)'|([A-Za-z_][A-Za-z0-9_]*))!)?"
+    r"(?<![A-Za-z0-9_])\$?([A-Z]{1,3})\$?:\$?([A-Z]{1,3})\$?(?![A-Za-z0-9_])"
+)
+ROW_ONLY_RE = re.compile(
+    r"(?:(?:'([^']+)'|([A-Za-z_][A-Za-z0-9_]*))!)?"
+    r"(?<![A-Za-z0-9_])\$?(\d{1,7})\$?:\$?(\d{1,7})\$?(?![A-Za-z0-9_])"
+)
+
+
+def extract_cross_sheet_refs(formula, current_sheet):
+    """Which OTHER sheets a formula references -- boolean presence only,
+    used solely to build the sheet-to-sheet flow graph (so we can tell
+    a break with an already-known formula link apart from a break with
+    no formula relationship between the two sheets at all)."""
+    refs = set()
+    for regex in (CELL_REF_RE, COLUMN_ONLY_RE, ROW_ONLY_RE):
+        for m in regex.finditer(formula):
+            sheet = m.group(1) or m.group(2)
+            if sheet and sheet != current_sheet:
+                refs.add(sheet)
+    return refs
+
+
+# ---------------------------------------------------------------------
+# Loading -- two passes are required (same reason dashboard.py loads
+# wb_values and wb_formulas separately): openpyxl's read_only worksheets
+# give you EITHER the formula text (data_only=False) OR the last-cached
+# computed value (data_only=True), never both from one load.
+# ---------------------------------------------------------------------
+
+def numeric_value(v):
+    """Normalizes a raw cell value to a comparable number, or None if
+    it isn't one. bool is a subclass of int in Python, so it's excluded
+    explicitly -- a TRUE/FALSE flag matching a number elsewhere is
+    meaningless. Floats are rounded to kill 0.1+0.2-style noise."""
+    if isinstance(v, bool):
+        return None
+    if isinstance(v, float):
+        return round(v, 6)
+    if isinstance(v, int):
+        return v
+    return None
+
+
+def is_distinctive(value, min_abs_value, allow_small_integers):
+    """Filters out values too common to mean anything as a match: near-
+    zero noise, and (by default) small round integers like 0-9, which
+    show up constantly as counts/flags/placeholders rather than copied
+    figures. --include-small-integers on the CLI disables the second
+    half of this if a workbook's real numbers happen to live in that
+    range (uncommon for tax workpapers, but not impossible)."""
+    if abs(value) < min_abs_value:
+        return False
+    if not allow_small_integers and value == int(value) and abs(value) < 10:
+        return False
+    return True
+
+
+def load_workbook_grid(path):
+    """Returns:
+      formulas   -- {(sheet, row, col): formula_text}
+      cell_kind  -- {(sheet, row, col): 'formula' | 'number' | 'text'}
+      cell_value -- {(sheet, row, col): normalized value (numbers only)}
+      sheetnames -- list, in file order
+    Row/col are 1-based integers (not string coords) so break detection
+    can do simple neighbor arithmetic without re-parsing addresses.
+    """
+    wb_f = load_workbook(path, data_only=False, read_only=True)
+    wb_v = load_workbook(path, data_only=True, read_only=True)
+
+    formulas = {}
+    cell_kind = {}
+    cell_value = {}
+    sheetnames = wb_f.sheetnames
+
+    for sheet_name in sheetnames:
+        ws_f = wb_f[sheet_name]
+        ws_v = wb_v[sheet_name] if sheet_name in wb_v.sheetnames else None
+        max_row = ws_f.max_row or 1
+        max_col = ws_f.max_column or 1
+
+        rows_f = ws_f.iter_rows(min_row=1, max_row=max_row, min_col=1, max_col=max_col)
+        rows_v = (
+            ws_v.iter_rows(min_row=1, max_row=max_row, min_col=1, max_col=max_col)
+            if ws_v is not None else None
+        )
+
+        for r_idx, row_f in enumerate(rows_f, start=1):
+            row_v = next(rows_v) if rows_v is not None else None
+            for c_idx, cell_f in enumerate(row_f, start=1):
+                key = (sheet_name, r_idx, c_idx)
+                raw_f = cell_f.value
+                if isinstance(raw_f, str) and raw_f.startswith("="):
+                    formulas[key] = raw_f
+                    cell_kind[key] = "formula"
+                    continue
+
+                raw_v = None
+                if row_v is not None and c_idx - 1 < len(row_v):
+                    raw_v = row_v[c_idx - 1].value
+                # fall back to the formula-pass cell's own value if there
+                # was no data_only sheet to cross-check against (rare)
+                if raw_v is None and not isinstance(raw_f, str):
+                    raw_v = raw_f
+
+                num = numeric_value(raw_v)
+                if num is not None:
+                    cell_kind[key] = "number"
+                    cell_value[key] = num
+                elif isinstance(raw_v, str) and raw_v.strip():
+                    cell_kind[key] = "text"
+
+    wb_f.close()
+    wb_v.close()
+    return formulas, cell_kind, cell_value, sheetnames
+
+
+# ---------------------------------------------------------------------
+# Pattern-break detection
+# ---------------------------------------------------------------------
+
+def find_pattern_breaks(cell_kind):
+    """A static NUMBER cell with a FORMULA cell immediately adjacent to
+    it -- same column (row above/below) or same row (column left/right)
+    -- is a pattern break. Returns a dict:
+        (sheet, row, col) -> list of direction strings, e.g.
+        ["vertical (formula above)", "horizontal (formula right)"]
+    A cell can break the pattern in more than one direction at once;
+    that's tracked (more directions = stronger signal) rather than
+    deduplicated away.
+    """
+    breaks = {}
+    for key, kind in cell_kind.items():
+        if kind != "number":
+            continue
+        sheet, row, col = key
+        directions = []
+        if cell_kind.get((sheet, row - 1, col)) == "formula":
+            directions.append("vertical (formula above)")
+        if cell_kind.get((sheet, row + 1, col)) == "formula":
+            directions.append("vertical (formula below)")
+        if cell_kind.get((sheet, row, col - 1)) == "formula":
+            directions.append("horizontal (formula left)")
+        if cell_kind.get((sheet, row, col + 1)) == "formula":
+            directions.append("horizontal (formula right)")
+        if directions:
+            breaks[key] = directions
+    return breaks
+
+
+# ---------------------------------------------------------------------
+# Value index -- across the primary workbook and any extra workbooks
+# supplied, so a match can point at a totally different file (the
+# extra-files list is exactly how this extends to health_check.py's
+# folder-wide cross-file matching later, without changing this function).
+# ---------------------------------------------------------------------
+
+def build_value_index(workbooks, min_abs_value, allow_small_integers, max_locations):
+    """workbooks: list of (label, cell_kind, cell_value) tuples, label
+    being the filename (or '' for the primary workbook, kept unlabeled
+    since every report row already names its own sheet). Returns:
+      index            -- value -> list of (label, sheet, row, col)
+      skipped_common    -- {value: location_count} for values that
+                            cleared distinctiveness but were dropped for
+                            appearing in more than max_locations places
+    """
+    raw_index = {}
+    for label, cell_kind, cell_value in workbooks:
+        for key, kind in cell_kind.items():
+            if kind != "number":
+                continue
+            value = cell_value[key]
+            if not is_distinctive(value, min_abs_value, allow_small_integers):
+                continue
+            sheet, row, col = key
+            raw_index.setdefault(value, []).append((label, sheet, row, col))
+
+    index = {}
+    skipped_common = {}
+    for value, locations in raw_index.items():
+        if len(locations) > max_locations:
+            skipped_common[value] = len(locations)
+            continue
+        index[value] = locations
+    return index, skipped_common
+
+
+# ---------------------------------------------------------------------
+# Flow graph (formula-based) -- used only to tell "this break's matched
+# source sheet already feeds this sheet via a real formula somewhere
+# else" apart from "these two sheets have no formula relationship at
+# all" -- the latter is the more severe finding.
+# ---------------------------------------------------------------------
+
+def build_flow_pairs(formulas):
+    pairs = set()
+    for (sheet, _row, _col), f in formulas.items():
+        for src in extract_cross_sheet_refs(f, sheet):
+            pairs.add((src, sheet))
+    return pairs
+
+
+# ---------------------------------------------------------------------
+# Matching breaks to values
+# ---------------------------------------------------------------------
+
+def coord(row, col):
+    return f"{get_column_letter(col)}{row}"
+
+
+def match_breaks(pattern_breaks, cell_value, primary_label, index, flow_pairs):
+    """Returns (matched, orphans):
+      matched -- list of dicts, one per (break cell, matched location)
+                 pair -- a break cell with more than one matching
+                 location gets more than one row, ranked cross-file/
+                 cross-sheet matches first.
+      orphans -- list of dicts, one per break cell with NO match found
+                 anywhere in the index (still worth a human glance, just
+                 lower confidence -- see module docstring).
+    """
+    matched = []
+    orphans = []
+
+    for (sheet, row, col), directions in pattern_breaks.items():
+        value = cell_value[(sheet, row, col)]
+        locations = index.get(value, [])
+        # never match a cell to itself
+        own = (primary_label, sheet, row, col)
+        real_locations = [loc for loc in locations if loc != own]
+
+        if not real_locations:
+            orphans.append({
+                "Sheet": sheet, "Cell": coord(row, col), "Value": value,
+                "Break Pattern": "; ".join(directions),
+            })
+            continue
+
+        # cross-file, then cross-sheet, then same-sheet -- most severe first
+        def rank(loc):
+            label, other_sheet, _r, _c = loc
+            cross_file = label != primary_label
+            cross_sheet = other_sheet != sheet
+            return (not cross_file, not cross_sheet)
+
+        real_locations.sort(key=rank)
+
+        for label, other_sheet, other_row, other_col in real_locations:
+            cross_file = label != primary_label
+            known_link = (not cross_file) and ((other_sheet, sheet) in flow_pairs)
+            matched.append({
+                "Sheet": sheet, "Cell": coord(row, col), "Value": value,
+                "Break Pattern": "; ".join(directions),
+                "Matched File": label if cross_file else "(same file)",
+                "Matched Sheet": other_sheet, "Matched Cell": coord(other_row, other_col),
+                "Same Sheet?": "Yes" if other_sheet == sheet and not cross_file else "No",
+                "Known Formula Link Elsewhere?": "Yes" if known_link else "No",
+                "Severity": (
+                    "HIGH - no existing formula link between these sheets" if not known_link and not cross_file
+                    else "HIGH - cross-file match, no in-workbook link" if cross_file
+                    else "MEDIUM - sheets are already formula-linked elsewhere"
+                ),
+            })
+
+    matched.sort(key=lambda r: (r["Severity"], r["Sheet"], r["Cell"]))
+    orphans.sort(key=lambda r: (r["Sheet"], r["Cell"]))
+    return matched, orphans
+
+
+# ---------------------------------------------------------------------
+# Excel report
+# ---------------------------------------------------------------------
+
+def write_report(matched, orphans, skipped_common, sheetnames, out_path):
+    wb = Workbook()
+
+    ws1 = wb.active
+    ws1.title = "Breaks With Matches"
+    headers1 = [
+        "Sheet", "Cell", "Value", "Break Pattern", "Matched File",
+        "Matched Sheet", "Matched Cell", "Same Sheet?",
+        "Known Formula Link Elsewhere?", "Severity",
+    ]
+    ws1.append(headers1)
+    for c in range(1, len(headers1) + 1):
+        ws1.cell(row=1, column=c).font = Font(bold=True)
+    high_fill = PatternFill("solid", fgColor="F4CCCC")
+    for row in matched:
+        ws1.append([row[h] for h in headers1])
+        if row["Severity"].startswith("HIGH"):
+            ws1.cell(row=ws1.max_row, column=headers1.index("Severity") + 1).fill = high_fill
+    ws1.freeze_panes = "A2"
+    for i, w in enumerate([18, 8, 14, 26, 20, 18, 12, 10, 16, 44], start=1):
+        ws1.column_dimensions[get_column_letter(i)].width = w
+
+    ws2 = wb.create_sheet("Orphan Breaks")
+    headers2 = ["Sheet", "Cell", "Value", "Break Pattern"]
+    ws2.append(headers2)
+    for c in range(1, len(headers2) + 1):
+        ws2.cell(row=1, column=c).font = Font(bold=True)
+    for row in orphans:
+        ws2.append([row[h] for h in headers2])
+    ws2.freeze_panes = "A2"
+    for i, w in enumerate([18, 8, 14, 26], start=1):
+        ws2.column_dimensions[get_column_letter(i)].width = w
+
+    ws3 = wb.create_sheet("Skipped Common Values")
+    ws3.append(["Value", "Location Count (excluded as too common)"])
+    ws3.cell(row=1, column=1).font = Font(bold=True)
+    ws3.cell(row=1, column=2).font = Font(bold=True)
+    for value, count in sorted(skipped_common.items(), key=lambda kv: -kv[1]):
+        ws3.append([value, count])
+    ws3.column_dimensions["A"].width = 16
+    ws3.column_dimensions["B"].width = 34
+
+    wb.save(out_path)
+
+
+# ---------------------------------------------------------------------
+# Visual -- sheet-level flow diagram (same vis-network approach as the
+# rest of the toolkit) with break points overlaid. Real formula edges
+# stay solid grey; break-driven value matches are dashed, colored by
+# severity, and labeled with how many break cells support that edge.
+# ---------------------------------------------------------------------
+
+HTML_TEMPLATE = """<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<script src="https://unpkg.com/vis-network/standalone/umd/vis-network.min.js"></script>
+<style>
+  html, body { margin:0; padding:0; background:#111111; }
+  #tree { width:100vw; height:100vh; }
+  #hint {
+    position:fixed; top:10px; left:10px; color:white; font-family:sans-serif;
+    font-size:13px; background:rgba(0,0,0,0.6); padding:10px 16px; border-radius:6px; max-width:480px;
+  }
+  .swatch { display:inline-block; width:14px; height:3px; margin-right:5px; vertical-align:middle; }
+</style>
+</head>
+<body>
+<div id="hint">
+  <b>Solid grey</b> = real formula link.<br>
+  <span class="swatch" style="background:#eb5757; border-top:2px dashed #eb5757;"></span>
+  <b>Dashed red</b> = break cells matched to a value here, with NO existing formula link between the sheets.<br>
+  <span class="swatch" style="background:#f2994a; border-top:2px dashed #f2994a;"></span>
+  <b>Dashed orange</b> = break cells matched to a value on a sheet that already formula-feeds this one elsewhere.<br>
+  Edge label = number of break cells behind that connection. Node halo = sheet contains at least one break.
+</div>
+<div id="tree"></div>
+<script type="text/javascript">
+  var nodes = new vis.DataSet(__NODES__);
+  var edges = new vis.DataSet(__EDGES__);
+  var network = new vis.Network(document.getElementById('tree'), {nodes: nodes, edges: edges}, {
+    layout: {
+      hierarchical: {
+        enabled: true, direction: "UD", sortMethod: "directed",
+        levelSeparation: 170, nodeSpacing: 190, treeSpacing: 230
+      }
+    },
+    physics: { hierarchicalRepulsion: { nodeDistance: 190 }, solver: "hierarchicalRepulsion" },
+    edges: { smooth: { type: "cubicBezier", forceDirection: "vertical" }, arrows: { to: { enabled: true } }, font: { color: "#ffffff" } },
+    nodes: { font: { color: "#ffffff", size: 15 } }
+  });
+  network.once("stabilizationIterationsDone", function () { network.setOptions({ physics: false }); });
+</script>
+</body>
+</html>
+"""
+
+
+def build_visual(formulas, matched, sheetnames, out_path):
+    flow = {}
+    for (sheet, _row, _col), f in formulas.items():
+        for src in extract_cross_sheet_refs(f, sheet):
+            flow[(src, sheet)] = flow.get((src, sheet), 0) + 1
+
+    break_sheets = set()
+    break_edges = {}  # (src, dst) -> {"count": n, "severity": "high"/"medium"}
+    for row in matched:
+        dst = row["Sheet"]
+        src = row["Matched Sheet"] if row["Matched File"] == "(same file)" else f'{row["Matched File"]}:{row["Matched Sheet"]}'
+        break_sheets.add(dst)
+        break_sheets.add(src)
+        key = (src, dst)
+        severity = "high" if row["Severity"].startswith("HIGH") else "medium"
+        entry = break_edges.setdefault(key, {"count": 0, "severity": severity})
+        entry["count"] += 1
+        if severity == "high":
+            entry["severity"] = "high"  # a mix of severities at the same edge escalates to high
+
+    all_sheets = set(sheetnames) | break_sheets
+    for src, dst in flow:
+        all_sheets.add(src)
+        all_sheets.add(dst)
+
+    has_incoming = {dst for (_src, dst) in flow}
+    has_outgoing = {src for (src, _dst) in flow}
+
+    nodes = []
+    for sheet in all_sheets:
+        if sheet not in has_incoming and sheet in has_outgoing:
+            color = "#2ecc71"
+        elif sheet in has_incoming and sheet not in has_outgoing:
+            color = "#f39c12"
+        else:
+            color = "#2a9d8f"
+        has_break = sheet in break_sheets
+        nodes.append({
+            "id": sheet, "label": sheet, "shape": "box", "size": 25,
+            "color": {
+                "background": color,
+                "border": "#eb5757" if has_break else "#ffffff",
+            },
+            "borderWidth": 4 if has_break else 1,
+            "title": f"{sheet}" + ("\\nContains at least one flow break" if has_break else ""),
+        })
+
+    edges = []
+    for (src, dst), count in flow.items():
+        edges.append({"from": src, "to": dst, "value": count, "label": str(count), "color": "#888888"})
+    for (src, dst), info in break_edges.items():
+        color = "#eb5757" if info["severity"] == "high" else "#f2994a"
+        edges.append({
+            "from": src, "to": dst, "dashes": True, "color": color,
+            "label": f"{info['count']} break(s)",
+            "title": "Possible copy-paste break(s) -- no formula edge exists here"
+                     if info["severity"] == "high" else
+                     "Possible copy-paste break(s) -- these sheets ARE linked by formula elsewhere too",
+        })
+
+    html = HTML_TEMPLATE.replace("__NODES__", json.dumps(nodes)).replace("__EDGES__", json.dumps(edges))
+    with open(out_path, "w", encoding="utf-8") as f:
+        f.write(html)
+
+
+# ---------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------
+
+def main():
+    parser = argparse.ArgumentParser(description="Find copy-paste flow breaks in an Excel workbook.")
+    parser.add_argument("workbook", help="Primary workbook to scan for pattern breaks.")
+    parser.add_argument("--extra-files", nargs="*", default=[],
+                         help="Additional workbooks to search for matching values (cross-file), "
+                              "without scanning them for their own pattern breaks.")
+    parser.add_argument("--min-abs-value", type=float, default=0.01,
+                         help="Ignore values smaller than this in magnitude (default 0.01).")
+    parser.add_argument("--include-small-integers", action="store_true",
+                         help="By default, whole numbers under 10 are treated as too common to "
+                              "match on (counts/flags). Pass this to include them anyway.")
+    parser.add_argument("--max-locations", type=int, default=20,
+                         help="A value appearing in more than this many cells workbook-wide is "
+                              "treated as too common to be meaningful evidence (default 20).")
+    parser.add_argument("--no-visual", action="store_true", help="Skip building the HTML diagram.")
+    args = parser.parse_args()
+
+    if not os.path.exists(args.workbook):
+        print(f"File not found: {args.workbook}")
+        sys.exit(1)
+
+    print(f"Loading {args.workbook} ...")
+    formulas, cell_kind, cell_value, sheetnames = load_workbook_grid(args.workbook)
+    print(f"  {len(formulas)} formulas, {len(cell_value)} static numeric cells, {len(sheetnames)} sheet(s).")
+
+    print("Finding pattern breaks (static cells adjacent to formulas)...")
+    pattern_breaks = find_pattern_breaks(cell_kind)
+    print(f"  {len(pattern_breaks)} candidate break cell(s) found.")
+
+    primary_label = os.path.basename(args.workbook)
+    workbooks_for_index = [(primary_label, cell_kind, cell_value)]
+    for extra_path in args.extra_files:
+        if not os.path.exists(extra_path):
+            print(f"  [!] Skipping extra file (not found): {extra_path}")
+            continue
+        print(f"Loading extra file for value matching: {extra_path} ...")
+        _f, extra_kind, extra_value, _s = load_workbook_grid(extra_path)
+        workbooks_for_index.append((os.path.basename(extra_path), extra_kind, extra_value))
+
+    print("Building value index...")
+    index, skipped_common = build_value_index(
+        workbooks_for_index, args.min_abs_value, args.include_small_integers, args.max_locations
+    )
+    print(f"  {len(index)} distinctive value(s) indexed, {len(skipped_common)} excluded as too common.")
+
+    flow_pairs = build_flow_pairs(formulas)
+
+    print("Matching break cells against the value index...")
+    matched, orphans = match_breaks(pattern_breaks, cell_value, primary_label, index, flow_pairs)
+    high_severity = sum(1 for r in matched if r["Severity"].startswith("HIGH"))
+    print(f"  {len(matched)} break-to-value match(es) found ({high_severity} high severity), "
+          f"{len(orphans)} orphan break(s) with no match.")
+
+    base, _ext = os.path.splitext(os.path.abspath(args.workbook))
+    report_path = base + "_flow_breaks.xlsx"
+    write_report(matched, orphans, skipped_common, sheetnames, report_path)
+    print(f"Wrote report to {report_path}")
+
+    if not args.no_visual:
+        visual_path = base + "_flow_breaks.html"
+        build_visual(formulas, matched, sheetnames, visual_path)
+        print(f"Wrote visual to {visual_path}")
+        webbrowser.open(f"file://{visual_path}")
+
+
+if __name__ == "__main__":
+    main()
