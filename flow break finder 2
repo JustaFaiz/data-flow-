@@ -1,0 +1,720 @@
+"""
+flow_break_finder.py
+----------------------
+Finds "flow breakages" in an Excel workbook -- cells that sit inside an
+otherwise formula-driven column or row but are themselves hardcoded static
+values, where that value also shows up somewhere else (in this workbook,
+in other workbooks you point it at, or in a whole folder of them).
+
+IMPORTANT: a matching value elsewhere does NOT automatically mean a broken
+link. There are three genuinely different explanations, and this script
+tells them apart instead of lumping them together as "breaks":
+
+  1. GENUINE BREAK -- the matched source sheet is itself part of the
+     active formula flow (either it already formula-feeds this sheet
+     somewhere else, or it's a formula-heavy working sheet, not a static
+     dump) -- so this one cell most likely SHOULD have been a formula
+     reference and wasn't. This is the real "someone pasted over a link"
+     case.
+  2. LIKELY EXTERNAL-SYSTEM SOURCE -- the matched sheet's name matches a
+     known raw-extract pattern (SAP, ERS, Corptax, Longview, DTTU, GL,
+     Trial Balance, Extract, Import, Source/Raw Data, Download,
+     Interface...). Data pulled from an external system and typed in by
+     hand is expected to be static -- it was never going to be a formula
+     link, so this isn't a break, it's the value's legitimate origin.
+  3. POSSIBLE REDUNDANT/INDEPENDENT ENTRY -- the matched sheet is mostly
+     static, isn't formula-connected to anything, and doesn't match a
+     known external-system name either. Most likely two independently
+     typed copies of the same figure (redundancy), not a missed link --
+     this is the case the existing value-overlap / cross-file value
+     matching elsewhere in the toolkit already covers; it's surfaced here
+     too, just kept in its own bucket instead of being called a "break".
+
+A pattern break with NO value match anywhere at all is reported separately
+as a lower-confidence "orphan break" -- still worth a glance, but there's
+no evidence either way for it.
+
+This is a genuinely different check from what's already in the rest of
+the toolkit:
+  - sheet_tree_server.py / health_check.py's sheet flow only look at REAL
+    formula links -- a pasted cell doesn't show up as an edge at all, so
+    a break is invisible to them, not flagged.
+  - dashboard.py's "value" tier fuzzy-match only fires for a sheet with
+    ZERO formula connection to anything -- it can't catch a break in the
+    MIDDLE of an otherwise formula-linked sheet (one cell in a column of
+    40 formulas overwritten), which is the more common real case.
+  - health_check.py's cross-file value fingerprinting looks for runs of
+    5+ CONSECUTIVE matching numbers with no regard to formula context --
+    good for "these two sheets share a data block", not for "this one
+    specific cell is where the chain snapped", and it doesn't distinguish
+    external-source or redundant explanations either.
+
+Requires:
+    pip install openpyxl
+
+Usage:
+    python flow_break_finder.py workbook.xlsx
+    python flow_break_finder.py workbook.xlsx --extra-files other1.xlsx other2.xlsx
+    python flow_break_finder.py workbook.xlsx --folder "C:\\Workpapers" --include-subfolders
+    python flow_break_finder.py workbook.xlsx --min-abs-value 0.01 --max-locations 15
+    python flow_break_finder.py workbook.xlsx --external-keyword "TB Adjustments" --external-keyword "OneSource"
+
+Outputs (next to the primary workbook):
+    <workbook>_flow_breaks.xlsx   -- report, one tab per explanation:
+                                      Likely Genuine Breaks, Likely
+                                      External-System Source, Possible
+                                      Redundant Entries, Orphan Breaks,
+                                      Skipped Common Values
+    <workbook>_flow_breaks.html   -- sheet-flow diagram with break points
+                                      overlaid, colored/dashed by which of
+                                      the three explanations applies,
+                                      opened in your browser automatically
+"""
+
+import argparse
+import json
+import os
+import re
+import sys
+import webbrowser
+
+from openpyxl import load_workbook, Workbook
+from openpyxl.styles import Font, PatternFill
+from openpyxl.utils import get_column_letter
+
+# ---------------------------------------------------------------------
+# Formula parsing -- same regex approach as the rest of the toolkit
+# (sheet_tree_server.py / dashboard.py), trimmed down to just "which
+# sheets does this formula cross-reference", since that's all the flow
+# graph here needs.
+# ---------------------------------------------------------------------
+
+CELL_REF_RE = re.compile(
+    r"(?:(?:'([^']+)'|([A-Za-z_][A-Za-z0-9_]*))!)?"
+    r"(?<![A-Za-z0-9_])(\$?[A-Z]{1,3}\$?\d{1,7})(?::(\$?[A-Z]{1,3}\$?\d{1,7}))?(?!\()"
+)
+COLUMN_ONLY_RE = re.compile(
+    r"(?:(?:'([^']+)'|([A-Za-z_][A-Za-z0-9_]*))!)?"
+    r"(?<![A-Za-z0-9_])\$?([A-Z]{1,3})\$?:\$?([A-Z]{1,3})\$?(?![A-Za-z0-9_])"
+)
+ROW_ONLY_RE = re.compile(
+    r"(?:(?:'([^']+)'|([A-Za-z_][A-Za-z0-9_]*))!)?"
+    r"(?<![A-Za-z0-9_])\$?(\d{1,7})\$?:\$?(\d{1,7})\$?(?![A-Za-z0-9_])"
+)
+
+
+def extract_cross_sheet_refs(formula, current_sheet):
+    """Which OTHER sheets a formula references -- boolean presence only,
+    used to build the sheet-to-sheet flow graph (known links) and, via
+    compute_formula_density below, to gauge how "formula-active" a sheet
+    is overall."""
+    refs = set()
+    for regex in (CELL_REF_RE, COLUMN_ONLY_RE, ROW_ONLY_RE):
+        for m in regex.finditer(formula):
+            sheet = m.group(1) or m.group(2)
+            if sheet and sheet != current_sheet:
+                refs.add(sheet)
+    return refs
+
+
+# ---------------------------------------------------------------------
+# External-system keyword matching -- word-boundary regex, not plain
+# substring, so short acronyms like "GL" or "TB" don't false-positive
+# inside ordinary sheet names ("Google", "Table") the way a naive
+# substring check would.
+# ---------------------------------------------------------------------
+
+DEFAULT_EXTERNAL_KEYWORDS = [
+    "SAP", "FICO", "ERS", "CORPTAX", "LONGVIEW", "DTTU",
+    "GL", "GENERAL LEDGER", "TRIAL BALANCE", "TB",
+    "EXTRACT", "IMPORT", "SOURCE DATA", "RAW DATA", "DOWNLOAD", "INTERFACE",
+]
+
+
+def matches_external_keywords(sheet_name, keywords):
+    """Custom boundary (not \\b) because \\b treats underscore as a word
+    character -- 'SAP_GL_Extract' would never match \\bSAP\\b since
+    there's no boundary before the underscore. Sheet names commonly use
+    underscores/hyphens as word separators, so alphanumeric-only
+    lookaround is used instead."""
+    for kw in keywords:
+        pattern = r"(?<![A-Za-z0-9])" + re.escape(kw) + r"(?![A-Za-z0-9])"
+        if re.search(pattern, sheet_name, re.IGNORECASE):
+            return kw
+    return None
+
+
+# ---------------------------------------------------------------------
+# Loading -- two passes are required (same reason dashboard.py loads
+# wb_values and wb_formulas separately): openpyxl's read_only worksheets
+# give you EITHER the formula text (data_only=False) OR the last-cached
+# computed value (data_only=True), never both from one load.
+# ---------------------------------------------------------------------
+
+def numeric_value(v):
+    """Normalizes a raw cell value to a comparable number, or None if it
+    isn't one. bool is a subclass of int in Python, so it's excluded
+    explicitly. Floats are rounded to kill 0.1+0.2-style noise."""
+    if isinstance(v, bool):
+        return None
+    if isinstance(v, float):
+        return round(v, 6)
+    if isinstance(v, int):
+        return v
+    return None
+
+
+def is_distinctive(value, min_abs_value, allow_small_integers):
+    """Filters out values too common to mean anything as a match: near-
+    zero noise, and (by default) small round integers under 10, which
+    show up constantly as counts/flags rather than copied figures."""
+    if abs(value) < min_abs_value:
+        return False
+    if not allow_small_integers and value == int(value) and abs(value) < 10:
+        return False
+    return True
+
+
+def load_workbook_grid(path):
+    """Returns:
+      formulas   -- {(sheet, row, col): formula_text}
+      cell_kind  -- {(sheet, row, col): 'formula' | 'number' | 'text'}
+      cell_value -- {(sheet, row, col): normalized value (numbers only)}
+      sheetnames -- list, in file order
+    Row/col are 1-based integers so break detection can do simple
+    neighbor arithmetic without re-parsing string addresses.
+    """
+    wb_f = load_workbook(path, data_only=False, read_only=True)
+    wb_v = load_workbook(path, data_only=True, read_only=True)
+
+    formulas = {}
+    cell_kind = {}
+    cell_value = {}
+    sheetnames = wb_f.sheetnames
+
+    for sheet_name in sheetnames:
+        ws_f = wb_f[sheet_name]
+        ws_v = wb_v[sheet_name] if sheet_name in wb_v.sheetnames else None
+        max_row = ws_f.max_row or 1
+        max_col = ws_f.max_column or 1
+
+        rows_f = ws_f.iter_rows(min_row=1, max_row=max_row, min_col=1, max_col=max_col)
+        rows_v = (
+            ws_v.iter_rows(min_row=1, max_row=max_row, min_col=1, max_col=max_col)
+            if ws_v is not None else None
+        )
+
+        for r_idx, row_f in enumerate(rows_f, start=1):
+            row_v = next(rows_v) if rows_v is not None else None
+            for c_idx, cell_f in enumerate(row_f, start=1):
+                key = (sheet_name, r_idx, c_idx)
+                raw_f = cell_f.value
+                if isinstance(raw_f, str) and raw_f.startswith("="):
+                    formulas[key] = raw_f
+                    cell_kind[key] = "formula"
+                    continue
+
+                raw_v = None
+                if row_v is not None and c_idx - 1 < len(row_v):
+                    raw_v = row_v[c_idx - 1].value
+                if raw_v is None and not isinstance(raw_f, str):
+                    raw_v = raw_f
+
+                num = numeric_value(raw_v)
+                if num is not None:
+                    cell_kind[key] = "number"
+                    cell_value[key] = num
+                elif isinstance(raw_v, str) and raw_v.strip():
+                    cell_kind[key] = "text"
+
+    wb_f.close()
+    wb_v.close()
+    return formulas, cell_kind, cell_value, sheetnames
+
+
+# ---------------------------------------------------------------------
+# Pattern-break detection
+# ---------------------------------------------------------------------
+
+def find_pattern_breaks(cell_kind):
+    """A static NUMBER cell with a FORMULA cell immediately adjacent to
+    it -- same column (row above/below) or same row (column left/right)
+    -- is a pattern break. Returns {(sheet,row,col): [direction, ...]}.
+    """
+    breaks = {}
+    for key, kind in cell_kind.items():
+        if kind != "number":
+            continue
+        sheet, row, col = key
+        directions = []
+        if cell_kind.get((sheet, row - 1, col)) == "formula":
+            directions.append("vertical (formula above)")
+        if cell_kind.get((sheet, row + 1, col)) == "formula":
+            directions.append("vertical (formula below)")
+        if cell_kind.get((sheet, row, col - 1)) == "formula":
+            directions.append("horizontal (formula left)")
+        if cell_kind.get((sheet, row, col + 1)) == "formula":
+            directions.append("horizontal (formula right)")
+        if directions:
+            breaks[key] = directions
+    return breaks
+
+
+def compute_formula_density(cell_kind):
+    """Per-sheet ratio of formula cells to (formula + static-number)
+    cells, for ONE workbook's cell_kind dict. Used as a proxy for "is
+    this sheet part of the active formula workspace, or is it a static
+    data dump" -- the latter being exactly what a raw import/extract
+    tab normally looks like, and exactly why a match against one
+    shouldn't be read as a missed formula link."""
+    counts = {}
+    for (sheet, _r, _c), kind in cell_kind.items():
+        if kind not in ("formula", "number"):
+            continue
+        f, n = counts.get(sheet, (0, 0))
+        if kind == "formula":
+            f += 1
+        else:
+            n += 1
+        counts[sheet] = (f, n)
+    return {sheet: (f / (f + n) if (f + n) else 0.0) for sheet, (f, n) in counts.items()}
+
+
+# ---------------------------------------------------------------------
+# Value index -- across the primary workbook and any extra workbooks
+# supplied (explicit --extra-files, and/or every workbook found via
+# --folder). A match can point at a totally different file.
+# ---------------------------------------------------------------------
+
+def build_value_index(workbooks, min_abs_value, allow_small_integers, max_locations):
+    """workbooks: list of (label, cell_kind, cell_value) tuples. Returns:
+      index          -- value -> list of (label, sheet, row, col)
+      skipped_common -- {value: location_count} dropped for appearing in
+                         more than max_locations places workbook-wide.
+    """
+    raw_index = {}
+    for label, cell_kind, cell_value in workbooks:
+        for key, kind in cell_kind.items():
+            if kind != "number":
+                continue
+            value = cell_value[key]
+            if not is_distinctive(value, min_abs_value, allow_small_integers):
+                continue
+            sheet, row, col = key
+            raw_index.setdefault(value, []).append((label, sheet, row, col))
+
+    index = {}
+    skipped_common = {}
+    for value, locations in raw_index.items():
+        if len(locations) > max_locations:
+            skipped_common[value] = len(locations)
+            continue
+        index[value] = locations
+    return index, skipped_common
+
+
+def build_flow_pairs(formulas):
+    """Real formula-based sheet-to-sheet edges, used to tell a break
+    whose source sheet already formula-feeds the target elsewhere apart
+    from one where no such relationship exists at all."""
+    pairs = set()
+    for (sheet, _row, _col), f in formulas.items():
+        for src in extract_cross_sheet_refs(f, sheet):
+            pairs.add((src, sheet))
+    return pairs
+
+
+# ---------------------------------------------------------------------
+# Classification -- the three-way split. Runs per matched location, not
+# per break cell, since the SAME break cell can match locations that
+# deserve different explanations (rare, but handled correctly).
+# ---------------------------------------------------------------------
+
+CLASSIFICATION_ORDER = ["genuine_break", "external_source", "redundant"]
+CLASSIFICATION_LABELS = {
+    "genuine_break": "Likely genuine break",
+    "external_source": "Likely external-system source",
+    "redundant": "Possible redundant/independent entry",
+}
+
+
+def classify_match(cross_file, other_sheet, known_link, source_density, external_keywords, density_threshold):
+    keyword_hit = matches_external_keywords(other_sheet, external_keywords)
+    if keyword_hit:
+        return "external_source", f"Source sheet name matches external-system keyword '{keyword_hit}'."
+    if known_link:
+        return "genuine_break", "Source sheet already formula-feeds the target sheet elsewhere -- this cell just wasn't linked."
+    if source_density >= density_threshold:
+        pct = round(source_density * 100, 1)
+        scope = "another workbook" if cross_file else "this workbook"
+        return "genuine_break", f"Source sheet is {pct}% formula-driven in {scope} -- part of the active flow, not a static dump."
+    pct = round(source_density * 100, 1)
+    scope = "another workbook" if cross_file else "this workbook"
+    return "redundant", f"Source sheet is only {pct}% formula-driven in {scope} and isn't linked to anything -- looks like an independent, separately-typed figure."
+
+
+def coord(row, col):
+    return f"{get_column_letter(col)}{row}"
+
+
+def match_breaks(pattern_breaks, cell_value, primary_label, index, flow_pairs,
+                  density_by_label, external_keywords, density_threshold):
+    """Returns (matched, orphans). matched rows carry a 'Classification'
+    key (one of CLASSIFICATION_ORDER) plus a human-readable 'Note'."""
+    matched = []
+    orphans = []
+
+    for (sheet, row, col), directions in pattern_breaks.items():
+        value = cell_value[(sheet, row, col)]
+        locations = index.get(value, [])
+        own = (primary_label, sheet, row, col)
+        real_locations = [loc for loc in locations if loc != own]
+
+        if not real_locations:
+            orphans.append({
+                "Sheet": sheet, "Cell": coord(row, col), "Value": value,
+                "Break Pattern": "; ".join(directions),
+            })
+            continue
+
+        for label, other_sheet, other_row, other_col in real_locations:
+            cross_file = label != primary_label
+            known_link = (not cross_file) and ((other_sheet, sheet) in flow_pairs)
+            source_density = density_by_label.get(label, {}).get(other_sheet, 0.0)
+            classification, note = classify_match(
+                cross_file, other_sheet, known_link, source_density, external_keywords, density_threshold
+            )
+            matched.append({
+                "Sheet": sheet, "Cell": coord(row, col), "Value": value,
+                "Break Pattern": "; ".join(directions),
+                "Matched File": label if cross_file else "(same file)",
+                "Matched Sheet": other_sheet, "Matched Cell": coord(other_row, other_col),
+                "Same Sheet?": "Yes" if other_sheet == sheet and not cross_file else "No",
+                "Known Formula Link Elsewhere?": "Yes" if known_link else "No",
+                "Source Formula Density": f"{round(source_density * 100, 1)}%",
+                "Classification": classification,
+                "Note": note,
+            })
+
+    matched.sort(key=lambda r: (CLASSIFICATION_ORDER.index(r["Classification"]), r["Sheet"], r["Cell"]))
+    orphans.sort(key=lambda r: (r["Sheet"], r["Cell"]))
+    return matched, orphans
+
+
+# ---------------------------------------------------------------------
+# Excel report
+# ---------------------------------------------------------------------
+
+def _write_match_sheet(wb, title, rows, fill_color=None):
+    ws = wb.create_sheet(title)
+    headers = [
+        "Sheet", "Cell", "Value", "Break Pattern", "Matched File",
+        "Matched Sheet", "Matched Cell", "Same Sheet?",
+        "Known Formula Link Elsewhere?", "Source Formula Density", "Note",
+    ]
+    ws.append(headers)
+    for c in range(1, len(headers) + 1):
+        ws.cell(row=1, column=c).font = Font(bold=True)
+    fill = PatternFill("solid", fgColor=fill_color) if fill_color else None
+    for row in rows:
+        ws.append([row[h] for h in headers])
+        if fill:
+            for c in range(1, len(headers) + 1):
+                ws.cell(row=ws.max_row, column=c).fill = fill
+    ws.freeze_panes = "A2"
+    for i, w in enumerate([18, 8, 14, 26, 20, 18, 12, 10, 16, 14, 60], start=1):
+        ws.column_dimensions[get_column_letter(i)].width = w
+    return ws
+
+
+def write_report(matched, orphans, skipped_common, out_path):
+    wb = Workbook()
+    wb.remove(wb.active)
+
+    by_class = {c: [r for r in matched if r["Classification"] == c] for c in CLASSIFICATION_ORDER}
+    _write_match_sheet(wb, "Likely Genuine Breaks", by_class["genuine_break"], fill_color="F4CCCC")
+    _write_match_sheet(wb, "Likely External-System Source", by_class["external_source"], fill_color="CFE2F3")
+    _write_match_sheet(wb, "Possible Redundant Entries", by_class["redundant"], fill_color="EAD1F2")
+
+    ws_orphan = wb.create_sheet("Orphan Breaks")
+    headers2 = ["Sheet", "Cell", "Value", "Break Pattern"]
+    ws_orphan.append(headers2)
+    for c in range(1, len(headers2) + 1):
+        ws_orphan.cell(row=1, column=c).font = Font(bold=True)
+    for row in orphans:
+        ws_orphan.append([row[h] for h in headers2])
+    ws_orphan.freeze_panes = "A2"
+    for i, w in enumerate([18, 8, 14, 26], start=1):
+        ws_orphan.column_dimensions[get_column_letter(i)].width = w
+
+    ws_skip = wb.create_sheet("Skipped Common Values")
+    ws_skip.append(["Value", "Location Count (excluded as too common)"])
+    ws_skip.cell(row=1, column=1).font = Font(bold=True)
+    ws_skip.cell(row=1, column=2).font = Font(bold=True)
+    for value, count in sorted(skipped_common.items(), key=lambda kv: -kv[1]):
+        ws_skip.append([value, count])
+    ws_skip.column_dimensions["A"].width = 16
+    ws_skip.column_dimensions["B"].width = 34
+
+    wb.save(out_path)
+
+
+# ---------------------------------------------------------------------
+# Visual -- sheet-level flow diagram, same vis-network approach as the
+# rest of the toolkit. Real formula edges stay solid grey. Break-driven
+# value matches are dashed and colored by classification, so "this is a
+# real break" is visually distinct from "this is probably just an SAP
+# extract" or "this is probably just redundant".
+# ---------------------------------------------------------------------
+
+CLASSIFICATION_EDGE_COLOR = {
+    "genuine_break": "#eb5757",     # red
+    "external_source": "#56ccf2",   # blue
+    "redundant": "#9b59b6",         # purple
+}
+
+HTML_TEMPLATE = """<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<script src="https://unpkg.com/vis-network/standalone/umd/vis-network.min.js"></script>
+<style>
+  html, body { margin:0; padding:0; background:#111111; }
+  #tree { width:100vw; height:100vh; }
+  #hint {
+    position:fixed; top:10px; left:10px; color:white; font-family:sans-serif;
+    font-size:13px; background:rgba(0,0,0,0.6); padding:10px 16px; border-radius:6px; max-width:480px;
+  }
+  .swatch { display:inline-block; width:14px; height:3px; margin-right:5px; vertical-align:middle; }
+</style>
+</head>
+<body>
+<div id="hint">
+  <b>Solid grey</b> = real formula link.<br>
+  <span class="swatch" style="background:#eb5757; border-top:2px dashed #eb5757;"></span>
+  <b>Dashed red</b> = likely genuine break -- source sheet is active in the formula flow, this cell just wasn't linked.<br>
+  <span class="swatch" style="background:#56ccf2; border-top:2px dashed #56ccf2;"></span>
+  <b>Dashed blue</b> = likely external-system source (SAP/ERS/Corptax-style) -- probably not a missed link.<br>
+  <span class="swatch" style="background:#9b59b6; border-top:2px dashed #9b59b6;"></span>
+  <b>Dashed purple</b> = possible redundant/independent entry -- probably two separately-typed copies of the same figure.<br>
+  Edge label = number of break cells behind that connection. Node halo = sheet contains at least one break.
+</div>
+<div id="tree"></div>
+<script type="text/javascript">
+  var nodes = new vis.DataSet(__NODES__);
+  var edges = new vis.DataSet(__EDGES__);
+  var network = new vis.Network(document.getElementById('tree'), {nodes: nodes, edges: edges}, {
+    layout: {
+      hierarchical: {
+        enabled: true, direction: "UD", sortMethod: "directed",
+        levelSeparation: 170, nodeSpacing: 190, treeSpacing: 230
+      }
+    },
+    physics: { hierarchicalRepulsion: { nodeDistance: 190 }, solver: "hierarchicalRepulsion" },
+    edges: { smooth: { type: "cubicBezier", forceDirection: "vertical" }, arrows: { to: { enabled: true } }, font: { color: "#ffffff" } },
+    nodes: { font: { color: "#ffffff", size: 15 } }
+  });
+  network.once("stabilizationIterationsDone", function () { network.setOptions({ physics: false }); });
+</script>
+</body>
+</html>
+"""
+
+
+def build_visual(formulas, matched, sheetnames, out_path):
+    flow = {}
+    for (sheet, _row, _col), f in formulas.items():
+        for src in extract_cross_sheet_refs(f, sheet):
+            flow[(src, sheet)] = flow.get((src, sheet), 0) + 1
+
+    break_sheets = set()
+    # (src, dst) -> {"genuine_break": n, "external_source": n, "redundant": n}
+    break_edges = {}
+    for row in matched:
+        dst = row["Sheet"]
+        src = row["Matched Sheet"] if row["Matched File"] == "(same file)" else f'{row["Matched File"]}:{row["Matched Sheet"]}'
+        break_sheets.add(dst)
+        break_sheets.add(src)
+        key = (src, dst)
+        entry = break_edges.setdefault(key, {c: 0 for c in CLASSIFICATION_ORDER})
+        entry[row["Classification"]] += 1
+
+    all_sheets = set(sheetnames) | break_sheets
+    for src, dst in flow:
+        all_sheets.add(src)
+        all_sheets.add(dst)
+
+    has_incoming = {dst for (_src, dst) in flow}
+    has_outgoing = {src for (src, _dst) in flow}
+
+    nodes = []
+    for sheet in all_sheets:
+        if sheet not in has_incoming and sheet in has_outgoing:
+            color = "#2ecc71"
+        elif sheet in has_incoming and sheet not in has_outgoing:
+            color = "#f39c12"
+        else:
+            color = "#2a9d8f"
+        has_break = sheet in break_sheets
+        nodes.append({
+            "id": sheet, "label": sheet, "shape": "box", "size": 25,
+            "color": {"background": color, "border": "#eb5757" if has_break else "#ffffff"},
+            "borderWidth": 4 if has_break else 1,
+            "title": f"{sheet}" + ("\\nContains at least one flow break" if has_break else ""),
+        })
+
+    edges = []
+    for (src, dst), count in flow.items():
+        edges.append({"from": src, "to": dst, "value": count, "label": str(count), "color": "#888888"})
+
+    for (src, dst), counts in break_edges.items():
+        # one edge per classification present on this sheet pair, so a
+        # pair with e.g. both a genuine break AND a redundant match gets
+        # two distinctly-colored dashed edges rather than one blended one
+        for classification in CLASSIFICATION_ORDER:
+            n = counts[classification]
+            if n == 0:
+                continue
+            edges.append({
+                "from": src, "to": dst, "dashes": True,
+                "color": CLASSIFICATION_EDGE_COLOR[classification],
+                "label": f"{n} ({CLASSIFICATION_LABELS[classification].lower()})",
+                "title": CLASSIFICATION_LABELS[classification],
+            })
+
+    html = HTML_TEMPLATE.replace("__NODES__", json.dumps(nodes)).replace("__EDGES__", json.dumps(edges))
+    with open(out_path, "w", encoding="utf-8") as f:
+        f.write(html)
+
+
+# ---------------------------------------------------------------------
+# Folder scan -- same top-level-by-default / --include-subfolders shape
+# as health_check.py's batch scan, just used here to auto-populate the
+# extra-files list for value matching rather than to run its own health
+# checks on each file.
+# ---------------------------------------------------------------------
+
+def gather_folder_files(folder_path, include_subfolders, exclude_path):
+    exclude_norm = os.path.normcase(os.path.normpath(os.path.abspath(exclude_path)))
+    found = []
+    if include_subfolders:
+        for root, _dirs, files in os.walk(folder_path):
+            for fn in files:
+                if fn.lower().endswith((".xlsx", ".xlsm")):
+                    full = os.path.join(root, fn)
+                    if os.path.normcase(os.path.normpath(os.path.abspath(full))) != exclude_norm:
+                        found.append(full)
+    else:
+        for fn in sorted(os.listdir(folder_path)):
+            if fn.lower().endswith((".xlsx", ".xlsm")):
+                full = os.path.join(folder_path, fn)
+                if os.path.normcase(os.path.normpath(os.path.abspath(full))) != exclude_norm:
+                    found.append(full)
+    return found
+
+
+# ---------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------
+
+def main():
+    parser = argparse.ArgumentParser(description="Find and classify copy-paste flow breaks in an Excel workbook.")
+    parser.add_argument("workbook", help="Primary workbook to scan for pattern breaks.")
+    parser.add_argument("--extra-files", nargs="*", default=[],
+                         help="Additional workbooks to search for matching values (cross-file).")
+    parser.add_argument("--folder", default=None,
+                         help="Also search every .xlsx/.xlsm in this folder for matching values "
+                              "(the primary workbook itself is automatically excluded).")
+    parser.add_argument("--include-subfolders", action="store_true",
+                         help="With --folder, recurse into subfolders instead of top-level only.")
+    parser.add_argument("--min-abs-value", type=float, default=0.01,
+                         help="Ignore values smaller than this in magnitude (default 0.01).")
+    parser.add_argument("--include-small-integers", action="store_true",
+                         help="By default, whole numbers under 10 are excluded as too common to "
+                              "match on. Pass this to include them anyway.")
+    parser.add_argument("--max-locations", type=int, default=20,
+                         help="A value appearing in more than this many cells workbook-wide is "
+                              "treated as too common to be meaningful evidence (default 20).")
+    parser.add_argument("--density-threshold", type=float, default=0.15,
+                         help="Minimum fraction (0-1) of a source sheet's cells that must be "
+                              "formulas for a no-known-link match to still count as a genuine "
+                              "break rather than a redundant entry (default 0.15).")
+    parser.add_argument("--external-keyword", action="append", default=[],
+                         help="Add a sheet-name keyword (beyond the SAP/ERS/Corptax/Longview/"
+                              "DTTU/GL/Trial Balance/Extract/etc. defaults) that marks a sheet "
+                              "as an external-system source. Repeatable.")
+    parser.add_argument("--no-visual", action="store_true", help="Skip building the HTML diagram.")
+    args = parser.parse_args()
+
+    if not os.path.exists(args.workbook):
+        print(f"File not found: {args.workbook}")
+        sys.exit(1)
+
+    external_keywords = DEFAULT_EXTERNAL_KEYWORDS + args.external_keyword
+
+    print(f"Loading {args.workbook} ...")
+    formulas, cell_kind, cell_value, sheetnames = load_workbook_grid(args.workbook)
+    print(f"  {len(formulas)} formulas, {len(cell_value)} static numeric cells, {len(sheetnames)} sheet(s).")
+
+    print("Finding pattern breaks (static cells adjacent to formulas)...")
+    pattern_breaks = find_pattern_breaks(cell_kind)
+    print(f"  {len(pattern_breaks)} candidate break cell(s) found.")
+
+    primary_label = os.path.basename(args.workbook)
+    workbooks_for_index = [(primary_label, cell_kind, cell_value)]
+
+    extra_paths = list(args.extra_files)
+    if args.folder:
+        if not os.path.isdir(args.folder):
+            print(f"  [!] --folder path not found, skipping: {args.folder}")
+        else:
+            folder_files = gather_folder_files(args.folder, args.include_subfolders, args.workbook)
+            print(f"Found {len(folder_files)} workbook(s) in {args.folder}"
+                  f"{' (including subfolders)' if args.include_subfolders else ''}.")
+            for fp in folder_files:
+                if fp not in extra_paths:
+                    extra_paths.append(fp)
+
+    for extra_path in extra_paths:
+        if not os.path.exists(extra_path):
+            print(f"  [!] Skipping extra file (not found): {extra_path}")
+            continue
+        print(f"Loading extra file for value matching: {extra_path} ...")
+        _f, extra_kind, extra_value, _s = load_workbook_grid(extra_path)
+        workbooks_for_index.append((os.path.basename(extra_path), extra_kind, extra_value))
+
+    print("Building value index...")
+    index, skipped_common = build_value_index(
+        workbooks_for_index, args.min_abs_value, args.include_small_integers, args.max_locations
+    )
+    print(f"  {len(index)} distinctive value(s) indexed, {len(skipped_common)} excluded as too common.")
+
+    flow_pairs = build_flow_pairs(formulas)
+    density_by_label = {label: compute_formula_density(ck) for label, ck, _cv in workbooks_for_index}
+
+    print("Matching break cells against the value index...")
+    matched, orphans = match_breaks(
+        pattern_breaks, cell_value, primary_label, index, flow_pairs,
+        density_by_label, external_keywords, args.density_threshold,
+    )
+    counts_by_class = {c: sum(1 for r in matched if r["Classification"] == c) for c in CLASSIFICATION_ORDER}
+    print(f"  {len(matched)} break-to-value match(es): "
+          f"{counts_by_class['genuine_break']} likely genuine break(s), "
+          f"{counts_by_class['external_source']} likely external-system source(s), "
+          f"{counts_by_class['redundant']} possible redundant entr(y/ies).")
+    print(f"  {len(orphans)} orphan break(s) with no value match anywhere.")
+
+    base, _ext = os.path.splitext(os.path.abspath(args.workbook))
+    report_path = base + "_flow_breaks.xlsx"
+    write_report(matched, orphans, skipped_common, report_path)
+    print(f"Wrote report to {report_path}")
+
+    if not args.no_visual:
+        visual_path = base + "_flow_breaks.html"
+        build_visual(formulas, matched, sheetnames, visual_path)
+        print(f"Wrote visual to {visual_path}")
+        webbrowser.open(f"file://{visual_path}")
+
+
+if __name__ == "__main__":
+    main()
